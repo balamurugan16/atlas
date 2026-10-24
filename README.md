@@ -54,30 +54,93 @@ The intended workflow is: “Research this book and add it to my reading list.�
 
 ### Authentication
 
-Atlas is single-owner. Both transports fail closed when authentication is unconfigured.
+Atlas is single-owner. It now hosts its own OAuth authorization server using `@cloudflare/workers-oauth-provider`. GitHub verifies your identity; Atlas issues the access and refresh tokens used by ChatGPT, Claude, or HTTP clients.
 
-- **Personal bearer token:** set `API_TOKEN` for curl, scripts, or MCP clients that support custom Authorization headers. Do not embed this token in a deployed React bundle.
-- **OAuth:** configure the four `OAUTH_*` variables from `.dev.vars.example`, plus `PUBLIC_URL`. Atlas verifies RS256/ES256 JWT access tokens against your authorization server's JWKS, checking signature, issuer, audience, expiry, exact owner subject, and the `atlas` scope. Tokens from other users are rejected.
-
-Atlas implements the **OAuth protected resource**, not an authorization server. To connect private data through ChatGPT/Claude, configure an external OAuth provider that supports the client's registration flow (dynamic registration/client metadata or a pre-registered client), authorization code with PKCE, and JWT access tokens for this API. Configure consent/access for your own account and grant the `atlas` scope. Set the API audience to your canonical `https://YOUR_WORKER/mcp` URL. The provider must expose OAuth authorization-server discovery metadata. Use its documented setup for the chosen client; do not select “no authentication” for this private API.
-
-Atlas publishes `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`, and advertises resource discovery in 401 responses. OAuth provider provisioning, client registration, and real ChatGPT/Claude sign-in require your account configuration and are not performed by this repository.
-
-For a future React dashboard, use an OAuth public client with authorization code + PKCE and short-lived access tokens. Set `DASHBOARD_ORIGIN` to its exact origin; cross-origin browser access is denied otherwise. CORS is not authentication. All OAuth tokens currently grant full reading-list access with a single `atlas` scope.
-
-## Deploy
-
-```sh
-bunx wrangler login
-bunx wrangler d1 create atlas
-# Copy the returned database_id into wrangler.jsonc.
-bun run db:migrate:remote
-bunx wrangler secret put API_TOKEN
-# Configure PUBLIC_URL and OAuth variables in Wrangler/Cloudflare if using OAuth.
-bun run deploy
+```text
+Client → Atlas consent → GitHub sign-in → Atlas owner check → Client receives Atlas tokens
 ```
 
-Set `PUBLIC_URL` to the canonical HTTPS Worker/custom-domain origin (no trailing path). Keep `OAUTH_AUDIENCE` consistent with the OAuth provider's API audience. Never commit tokens. No Cloudflare resources are created automatically by installing or building this project.
+- **GitHub OAuth:** set `PUBLIC_URL`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `GITHUB_OWNER_ID`, and bind `OAUTH_KV`. Only the configured numeric GitHub user ID can authorize access.
+- **Personal bearer token:** optionally keep `API_TOKEN` for curl, scripts, or MCP clients with custom Authorization headers. It works even when GitHub is not configured. Never embed it in a deployed frontend bundle.
+
+The old external-provider `OAUTH_ISSUER`, `OAUTH_JWKS_URL`, `OAUTH_AUDIENCE`, and `OAUTH_OWNER_SUB` variables are no longer used. No Auth0, WorkOS, or other hosted authorization server is required.
+
+OAuth grants use the `atlas` scope for full reading-list access through both transports. The canonical resource/audience is the **Worker origin**, e.g. `https://atlas.example.com`, while the MCP connection URL is `https://atlas.example.com/mcp`. Discovery advertises that distinction automatically.
+
+Access tokens last one hour and refresh grants last 30 days. Refresh tokens rotate, with the immediately previous token accepted until its replacement is first used to allow retries. GitHub is used only during sign-in: its token is not retained, so revoking the GitHub app does not automatically revoke already-issued Atlas grants. Atlas supports RFC 7009 revocation at its advertised revocation endpoint (`/oauth/token`). Keep client tokens private.
+
+Consent and GitHub state are short-lived, single-use, and bound to secure browser cookies. The callback always obtains the account ID from GitHub's authenticated `/user` API, rather than trusting a username or browser parameter. A change to `GITHUB_OWNER_ID` prevents existing grants for the old owner from accessing or refreshing.
+
+### Configure GitHub and deploy
+
+1. Pick your permanent Worker URL or custom-domain origin. Set `PUBLIC_URL` to that exact HTTPS origin, without a path. All requests must use that origin when it is configured.
+2. Under **GitHub → Settings → Developer settings → OAuth Apps → New OAuth App**, create an app:
+
+   | Setting                    | Value                                                  |
+   | -------------------------- | ------------------------------------------------------ |
+   | Application name           | Atlas                                                  |
+   | Homepage URL               | `https://YOUR_WORKER.workers.dev`                      |
+   | Authorization callback URL | `https://YOUR_WORKER.workers.dev/auth/github/callback` |
+
+   Atlas requests no GitHub repository or email scopes; public profile identity is sufficient. Device flow is not used.
+3. Find your numeric GitHub account ID from `https://api.github.com/users/YOUR_USERNAME` (the `id` field), or `gh api user --jq '.id'` if GitHub CLI is authenticated. Use this value for `GITHUB_OWNER_ID`, not your username.
+4. Create the OAuth KV namespace:
+
+   ```sh
+   bunx wrangler login
+   bunx wrangler kv namespace create OAUTH_KV
+   ```
+
+   Copy its ID over `REPLACE_WITH_OAUTH_KV_NAMESPACE_ID` in `wrangler.jsonc`. KV holds OAuth clients, consent/state transactions, grants, and token records. Your books remain in D1.
+5. Configure non-secret Worker variables, either under **Cloudflare → Workers & Pages → atlas → Settings → Variables and Secrets** or by adding this top-level `vars` block to `wrangler.jsonc`:
+
+   ```json
+   "vars": {
+     "PUBLIC_URL": "https://YOUR_WORKER.workers.dev",
+     "GITHUB_OWNER_ID": "YOUR_NUMERIC_GITHUB_ID"
+   }
+   ```
+
+   Set the GitHub credentials as secrets:
+
+   ```sh
+   bunx wrangler secret put GITHUB_CLIENT_ID
+   bunx wrangler secret put GITHUB_CLIENT_SECRET
+   # Optional direct access for scripts:
+   bunx wrangler secret put API_TOKEN
+   ```
+
+   Do not paste the GitHub client secret into ChatGPT or commit it to Wrangler config.
+6. Confirm your D1 ID is configured in `wrangler.jsonc`, apply production migrations, and deploy:
+
+   ```sh
+   # For a new database only: bunx wrangler d1 create atlas
+   bun run db:migrate:remote
+   bun run deploy
+   ```
+
+The checked-in `global_fetch_strictly_public` compatibility flag enables safe Client ID Metadata Document (CIMD) discovery. Dynamic client registration is also available for clients that use it. The consent page shows the requesting client and callback host before GitHub sign-in. Client registration alone does not grant access to your books.
+
+### Connect an MCP client
+
+Add `https://YOUR_WORKER.workers.dev/mcp` as a remote MCP server in ChatGPT or Claude and choose **OAuth**. Allow the requested Atlas access, sign in with the GitHub account matching `GITHUB_OWNER_ID`, and finish the connection. Atlas handles client registration/discovery; the GitHub OAuth App's credentials belong only in your Worker.
+
+You can inspect these public discovery endpoints after deployment:
+
+```text
+/.well-known/oauth-authorization-server
+/.well-known/oauth-protected-resource
+```
+
+A request without a token to `/mcp` must return `401` with a `WWW-Authenticate` header pointing to resource metadata. GitHub authorization is enabled only when all four variables and KV are configured. Without them, OAuth login returns `503`; personal-token access can still be used.
+
+### Local development
+
+The initial local setup above still works with just `API_TOKEN`. Wrangler supplies local D1 and KV storage, separate from production. You do not need real GitHub credentials to run the automated tests; they simulate GitHub's responses while exercising the complete OAuth flow in workerd.
+
+For a manual local GitHub login, use a local HTTPS endpoint (for example `bun run dev --local-protocol https`) and set `PUBLIC_URL=https://localhost:8787` plus the three `GITHUB_*` values in `.dev.vars`. Register `https://localhost:8787/auth/github/callback` with a development GitHub OAuth App, and accept Wrangler's development certificate in your browser. Secure consent cookies require HTTPS; do not use plain HTTP for manual sign-in. To test from a hosted MCP client, use a deployed HTTPS Worker that the client can reach.
+
+For a future React dashboard, use an OAuth public client with authorization code + S256 PKCE, the `atlas` scope, and the Worker origin as its resource. Set `DASHBOARD_ORIGIN` to the exact dashboard origin; cross-origin browser access is denied otherwise. No frontend is included yet.
 
 ## Formatting
 
@@ -95,13 +158,16 @@ bun run typecheck
 bun run test
 ```
 
-Tests build a deployable bundle, start workerd through Miniflare, apply the real D1 migration to an isolated test database, and exercise HTTP/MCP interoperability, validation, duplicate ISBNs, pagination, OAuth verification, owner restrictions, browser Origins, and authentication failures. They require permission to open local ports. No remote database or OAuth account is used.
+Tests build a deployable bundle, start workerd through Miniflare, apply the real D1 migration to an isolated test database, and exercise HTTP/MCP interoperability, validation, duplicate ISBNs, pagination, GitHub owner restrictions, consent/state cookies, PKCE, OAuth discovery, token exchange, refresh/revocation, browser Origins, and authentication failures. GitHub and client-metadata responses are mocked; tests do not contact GitHub. They require permission to open local ports. No remote database or OAuth account is used.
 
 ## Layout
 
 ```text
-src/index.ts                       Hono app, middleware, transport wiring
-src/auth.ts                        Bearer/JWT verification
+src/index.ts                       Outer router and security middleware
+src/api.ts                         Authenticated HTTP/MCP transport wiring
+src/auth.ts                        Configuration and personal-token checks
+src/oauth.ts                       Atlas OAuth authorization/token server
+src/github.ts                      Consent, GitHub sign-in and owner check
 src/mcp.ts                         MCP tool adapters
 src/modules/reading-list/schema.ts Shared input contracts
 src/modules/reading-list/service.ts D1 operations

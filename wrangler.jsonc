@@ -3,10 +3,7 @@
   "name": "atlas",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
-  "compatibility_flags": [
-    "nodejs_compat",
-    "global_fetch_strictly_public"
-  ],
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "d1_databases": [
     {
       "binding": "DB",
@@ -18,7 +15,7 @@
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
-      "id": "REPLACE_WITH_OAUTH_KV_NAMESPACE_ID"
+      "id": "eb4da41d39b04be7805e730b4701c876"
     }
   ]
 }

@@ -15,8 +15,12 @@ export function publicOrigin(env: Env): string | null {
 
 export function oauthEnabled(env: Env): boolean {
   return !!(
-    publicOrigin(env) && env.OAUTH_KV && env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET &&
-    env.GITHUB_OWNER_ID && /^[1-9]\d*$/.test(env.GITHUB_OWNER_ID)
+    publicOrigin(env) &&
+    env.OAUTH_KV &&
+    env.GITHUB_CLIENT_ID &&
+    env.GITHUB_CLIENT_SECRET &&
+    env.GITHUB_OWNER_ID &&
+    /^[1-9]\d*$/.test(env.GITHUB_OWNER_ID)
   );
 }
 

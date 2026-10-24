@@ -30,12 +30,14 @@ app.use('*', async (c, next) => {
 });
 app.get('/health', (c) => c.json({ status: 'ok' }));
 app.all('*', async (c) => {
-  const protectedPath = c.req.path === '/mcp' || c.req.path.startsWith('/mcp/') || c.req.path.startsWith('/api/');
-  if (protectedPath && await authorizedWithApiToken(c.req.raw, c.env))
+  const protectedPath =
+    c.req.path === '/mcp' || c.req.path.startsWith('/mcp/') || c.req.path.startsWith('/api/');
+  if (protectedPath && (await authorizedWithApiToken(c.req.raw, c.env)))
     return api.fetch(c.req.raw, c.env, c.executionCtx);
   if (oauthEnabled(c.env))
     return getOAuthProvider(c.env).fetch(
-      c.req.raw, c.env,
+      c.req.raw,
+      c.env,
       // Hono exposes a narrower view of the actual Workers execution context.
       c.executionCtx as Parameters<ReturnType<typeof getOAuthProvider>['fetch']>[2],
     );
@@ -44,7 +46,10 @@ app.all('*', async (c) => {
     c.header('WWW-Authenticate', 'Bearer realm="atlas"');
     return c.json({ error: 'Unauthorized' }, 401);
   }
-  if (['/authorize', '/auth/github/callback'].includes(c.req.path) || c.req.path.startsWith('/oauth/'))
+  if (
+    ['/authorize', '/auth/github/callback'].includes(c.req.path) ||
+    c.req.path.startsWith('/oauth/')
+  )
     return c.json({ error: 'GitHub OAuth is not configured' }, 503);
   return c.json({ error: 'Not found' }, 404);
 });
