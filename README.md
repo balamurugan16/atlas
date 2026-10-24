@@ -34,23 +34,50 @@ Fields: `title` (required), `authors`, `tags`, `isbn`, `description`, `coverUrl`
 
 ISBNs are normalized and checksum validated. Duplicate ISBNs return HTTP 409. Books without ISBNs can have duplicate titles: different editions may share a title. Use search before adding. Cover images are stored as URLs; Atlas does not download images or verify ownership/availability of remote URLs.
 
-| HTTP                       | MCP tool      | Behavior               |
-| -------------------------- | ------------- | ---------------------- |
-| `POST /api/v1/books`       | `add_book`    | Add supplied metadata  |
-| `GET /api/v1/books`        | `list_books`  | Search and filter      |
-| `GET /api/v1/books/:id`    | `get_book`    | Retrieve book          |
-| `PATCH /api/v1/books/:id`  | `update_book` | Update supplied fields |
-| `DELETE /api/v1/books/:id` | `delete_book` | Permanently delete     |
+| HTTP                       | MCP tool           | Behavior                                      |
+| -------------------------- | ------------------ | --------------------------------------------- |
+| `POST /api/v1/books`       | `add_book`         | Add supplied metadata                         |
+| `GET /api/v1/books`        | `list_books`       | Search and filter                             |
+| `GET /api/v1/books/values` | `list_book_values` | Discover tags/authors/status with book counts |
+| `GET /api/v1/books/:id`    | `get_book`         | Retrieve book                                 |
+| `PATCH /api/v1/books/:id`  | `update_book`      | Update supplied fields                        |
+| `DELETE /api/v1/books/:id` | `delete_book`      | Permanently delete                            |
 
-List accepts `q` (literal case-insensitive title/author search), `tag` (exact match), `status`, `limit` (1–100, default 25), and `offset` (default 0). Results are `{items, nextOffset}`. Ordering is newest first with ID as a tie breaker. Offset pagination is suitable for a personal list; concurrent inserts may move page boundaries.
+For category requests such as “list all programming books”, first call `list_book_values` with `field: "tags"` to discover the stored vocabulary, then pass the relevant values to `list_books.tags`. Discovery also supports `field: "authors"` or `"status"`, optional substring `q`, `status`, and pagination (`limit` up to 200). Counts represent distinct books; case variants are grouped together.
+
+`list_books` and HTTP list share these filters:
+
+- `tags`: exact case-insensitive tags, with `tagsMatch: "any"` (default) or `"all"`; legacy single `tag` also works.
+- `authors`: any exact case-insensitive author name; `author` searches an author substring.
+- `title`, `description`, `notes`: case-insensitive literal substrings; `isbn`: exact normalized ISBN; `status`: exact reading status.
+- `q`: literal search across title, authors, tags, description, notes and ISBN. `searchFields` restricts the fields searched.
+- `hasCover`, `hasDescription`: boolean metadata-presence filters.
+
+Different filters combine with AND. Responses are `{items, total, nextOffset}`, with a filtered total. Follow `nextOffset` using the same filters until null when requesting every match. `limit` is 1–100 (default 25). `sortBy` accepts `createdAt` (default), `updatedAt`, or `title`; `order` defaults to `desc`.
+
+MCP defaults to `view: "summary"` (IDs, titles, authors, tags, status, ISBN and metadata-presence flags) to keep large results manageable. Use `get_book` or `view: "full"` for complete metadata. HTTP defaults to full records. Repeated HTTP query parameters represent arrays, for example `/api/v1/books?tags=Programming&tags=Software%20Engineering&tagsMatch=any`. Boolean query parameters accept `true` or `false`.
+
+Tags reflect saved metadata: category filtering cannot find books whose relevant tags are missing. Use text search as a fallback and enrich those books through `update_book`. Offset pagination is suitable for a personal list; concurrent edits can move page boundaries.
 
 PATCH leaves omitted fields alone, replaces arrays, and accepts `null` for ISBN, description, cover URL and notes. Unknown fields and empty updates are rejected. Request bodies are limited to 64 KiB. HTTP failures return `{error}`; validation failures also include `issues`. MCP domain errors use `isError`.
 
 ## ChatGPT and Claude
 
-The remote MCP endpoint is `https://YOUR_WORKER/mcp`, using Streamable HTTP with stateless compatibility for legacy clients. Each request creates a server; D1 persists all data. There are no Durable Objects or MCP session storage requirements.
+The recommended remote MCP endpoint is `https://YOUR_WORKER/mcp` (the Worker origin `/` is also accepted as an authenticated alias), using Streamable HTTP with stateless compatibility for legacy clients. Each request creates a server; D1 persists all data. There are no Durable Objects or MCP session storage requirements.
 
 The intended workflow is: “Research this book and add it to my reading list.” The MCP instructions ask the client to research reliable sources, pass verified metadata, include source URLs, and omit unknown details. **The client must have browsing/search tools available.** An MCP connection alone does not give a model web access. Atlas itself has no LLM or web-search dependency and needs no OpenAI or Anthropic API key.
+
+### Metadata completeness in MCP
+
+`add_book` requires explicit `authors`, `tags`, `description`, `coverUrl`, and `sourceUrls` in addition to the title. Field descriptions and server instructions direct the client to verify the chosen edition, research a useful description, and find a direct cover-image URL before saving.
+
+ISBN is optional: omit it or pass `null` without an explanation when unknown. Supplied ISBNs are still checksum validated and deduplicated.
+
+Unknown required metadata must be passed as `null` (description, cover) or an empty array, with a matching `metadataUnavailable` explanation. Unexplained omissions, blank descriptions, and unexplained empty arrays are rejected. The MCP result includes `metadataCompleteness` with `complete`, `missingFields`, and `unavailableReasons`; the client is instructed to disclose gaps to you. These explanations are returned with the save result, not stored as database columns.
+
+This enforces explicit metadata accounting, not factual correctness: the client still needs browsing or reliable user-provided information, and Atlas does not verify external sources or download cover images. The HTTP create endpoint continues to accept a title alone for manual entry. Existing incomplete books can be enriched through `update_book`; no migration or automatic rewrite of existing books is performed.
+
+After deploying a change to the MCP schema, use **Refresh tools** in the client's connection settings and start a new chat so the client receives the updated requirements.
 
 ### Authentication
 

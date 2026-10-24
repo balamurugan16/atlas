@@ -57,8 +57,8 @@ async function request(path, method = 'GET', body, token = secret, extraHeaders 
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
 }
-async function rpc(method, params, token = secret) {
-  const response = await request('/mcp', 'POST', { jsonrpc: '2.0', id: 1, method, params }, token, {
+async function rpc(method, params, token = secret, path = '/mcp') {
+  const response = await request(path, 'POST', { jsonrpc: '2.0', id: 1, method, params }, token, {
     Accept: 'application/json, text/event-stream',
     'MCP-Protocol-Version': '2025-03-26',
   });
@@ -77,7 +77,7 @@ async function rpc(method, params, token = secret) {
 }
 test('private endpoints reject absent and invalid credentials; health is public', async () => {
   assert.equal((await request('/health', 'GET', undefined, '')).status, 200);
-  for (const path of ['/api/v1/books', '/mcp']) {
+  for (const path of ['/', '/api/v1/books', '/mcp']) {
     const r = await request(path, 'GET', undefined, '');
     assert.equal(r.status, 401);
     assert.match(r.headers.get('WWW-Authenticate'), /resource_metadata/);
@@ -114,7 +114,7 @@ test('browser origins and preflight are enforced', async () => {
   assert.equal(r.status, 204);
   assert.equal(r.headers.get('Access-Control-Allow-Origin'), 'https://dashboard.example');
 });
-test('MCP initializes and lists five tools with usable schemas', async () => {
+test('MCP initializes and lists six tools with usable schemas', async () => {
   const init = await rpc('initialize', {
     protocolVersion: '2025-03-26',
     capabilities: {},
@@ -122,8 +122,32 @@ test('MCP initializes and lists five tools with usable schemas', async () => {
   });
   assert.equal(init.result.serverInfo.name, 'atlas');
   const list = await rpc('tools/list', {});
-  assert.equal(list.result.tools.length, 5);
-  assert.ok(list.result.tools.find((t) => t.name === 'add_book').inputSchema.properties.title);
+  assert.equal(list.result.tools.length, 6);
+  const schema = list.result.tools.find((t) => t.name === 'add_book').inputSchema;
+  for (const field of ['title', 'authors', 'tags', 'description', 'coverUrl', 'sourceUrls']) {
+    assert.ok(schema.required.includes(field), `${field} must be explicit in the MCP contract`);
+    assert.ok(schema.properties[field].description, `${field} needs client guidance`);
+  }
+  assert.ok(!schema.required.includes('isbn'), 'ISBN must stay optional for MCP clients');
+});
+test('Worker origin is an authenticated MCP alias with the same tools as /mcp', async () => {
+  const init = await rpc(
+    'initialize',
+    {
+      protocolVersion: '2025-03-26',
+      capabilities: {},
+      clientInfo: { name: 'root-client', version: '1' },
+    },
+    secret,
+    '/',
+  );
+  assert.equal(init.result.serverInfo.name, 'atlas');
+  const [root, canonical] = await Promise.all([
+    rpc('tools/list', {}, secret, '/'),
+    rpc('tools/list', {}),
+  ]);
+  assert.deepEqual(root.result.tools, canonical.result.tools);
+  assert.equal(root.result.tools.length, 6);
 });
 test('MCP writes are visible through HTTP; duplicate ISBN rejected; update and delete shared', async () => {
   const added = await rpc('tools/call', {
@@ -133,6 +157,8 @@ test('MCP writes are visible through HTTP; duplicate ISBN rejected; update and d
       authors: ['Ursula K. Le Guin'],
       tags: ['fantasy'],
       isbn: '978-0-547-77374-2',
+      description:
+        'A young wizard discovers the consequences of his own ambition and must confront the shadow he has unleashed.',
       coverUrl: 'https://example.com/cover.jpg',
       sourceUrls: ['https://example.com/book'],
     },
@@ -142,6 +168,10 @@ test('MCP writes are visible through HTTP; duplicate ISBN rejected; update and d
   const get = await (await request('/api/v1/books/' + book.id)).json();
   assert.equal(get.title, 'A Wizard of Earthsea');
   assert.equal(get.isbn, '9780547773742');
+  assert.equal(get.description, book.description);
+  assert.equal(get.coverUrl, 'https://example.com/cover.jpg');
+  assert.equal(book.metadataCompleteness.complete, true);
+  assert.deepEqual(book.metadataCompleteness.missingFields, []);
   assert.equal(
     (await request('/api/v1/books', 'POST', { title: 'Duplicate', isbn: book.isbn })).status,
     409,
@@ -401,6 +431,8 @@ async function signIn(options) {
 test('GitHub owner sign-in issues Atlas tokens usable through HTTP and MCP', async () => {
   const { flow, tokens, code } = await signIn();
   const oauthToken = tokens.access_token;
+  const rootTools = await rpc('tools/list', {}, oauthToken, '/');
+  assert.equal(rootTools.result.tools.length, 6);
   assert.ok(!tokens.access_token.startsWith('github-test-'));
   assert.equal((await request('/api/v1/books', 'GET', undefined, oauthToken)).status, 200);
   const rpcResponse = await request(
@@ -637,5 +669,209 @@ test('absent GitHub configuration keeps personal-token access and fails closed o
     assert.match(await direct.text(), /add_book/);
   } finally {
     await local.dispose();
+  }
+});
+
+test('MCP refuses silently incomplete book metadata without writing a row', async () => {
+  const complete = {
+    title: 'Metadata contract test',
+    authors: ['Verified Author'],
+    tags: ['fiction'],
+    isbn: '9780547773742',
+    description: 'A source-grounded synopsis supplied after researching this book.',
+    coverUrl: 'https://example.com/verified-cover.jpg',
+    sourceUrls: ['https://example.com/source'],
+  };
+  for (const field of ['authors', 'tags', 'description', 'coverUrl', 'sourceUrls']) {
+    const args = { ...complete };
+    delete args[field];
+    const response = await rpc('tools/call', { name: 'add_book', arguments: args });
+    assert.ok(response.error || response.result.isError, `${field} cannot be silently omitted`);
+  }
+  for (const changes of [
+    { description: null },
+    { coverUrl: null },
+    { authors: [] },
+    { tags: [] },
+    { sourceUrls: [] },
+  ]) {
+    const response = await rpc('tools/call', {
+      name: 'add_book',
+      arguments: { ...complete, ...changes },
+    });
+    assert.ok(response.error || response.result.isError, 'Missing metadata needs an explanation');
+  }
+  const contradiction = await rpc('tools/call', {
+    name: 'add_book',
+    arguments: {
+      ...complete,
+      metadataUnavailable: { coverUrl: 'No verified cover was available after research.' },
+    },
+  });
+  assert.ok(contradiction.error || contradiction.result.isError);
+  const list = await (await request('/api/v1/books?q=Metadata%20contract%20test')).json();
+  assert.equal(list.items.length, 0);
+});
+test('explicitly unavailable metadata is reported, with no fabricated fallback values', async () => {
+  const args = {
+    title: 'Uncatalogued metadata test',
+    authors: [],
+    tags: [],
+    isbn: null,
+    description: null,
+    coverUrl: null,
+    sourceUrls: [],
+    metadataUnavailable: {
+      authors: 'The supplied title could not be matched to a verified author.',
+      tags: 'The subject and genre could not be verified from the available information.',
+      isbn: 'No edition or ISBN could be verified from the supplied information.',
+      description: 'Browsing is unavailable and the user did not provide a synopsis.',
+      coverUrl: 'Browsing is unavailable and no direct cover image was supplied.',
+      sourceUrls: 'No source URLs were supplied and browsing is unavailable in this session.',
+    },
+  };
+  const response = await rpc('tools/call', { name: 'add_book', arguments: args });
+  assert.ok(!response.result.isError, JSON.stringify(response));
+  const book = JSON.parse(response.result.content[0].text);
+  assert.equal(book.metadataCompleteness.complete, false);
+  assert.deepEqual(book.metadataCompleteness.unavailableReasons, args.metadataUnavailable);
+  assert.deepEqual(
+    book.metadataCompleteness.missingFields.sort(),
+    Object.keys(args.metadataUnavailable).sort(),
+  );
+  const saved = await (await request('/api/v1/books/' + book.id)).json();
+  assert.equal(saved.description, null);
+  assert.equal(saved.coverUrl, null);
+  // An existing incomplete entry can be enriched without creating another book.
+  const update = await rpc('tools/call', {
+    name: 'update_book',
+    arguments: {
+      id: book.id,
+      changes: {
+        description: 'A verified description provided after researching the book.',
+        coverUrl: 'https://example.com/found-cover.jpg',
+      },
+    },
+  });
+  assert.ok(!update.result.isError);
+  const enriched = await (await request('/api/v1/books/' + book.id)).json();
+  assert.equal(enriched.coverUrl, 'https://example.com/found-cover.jpg');
+  assert.match(enriched.description, /verified description/);
+  await request('/api/v1/books/' + book.id, 'DELETE');
+});
+
+test('MCP accepts omitted or null ISBN without an explanation, but rejects invalid supplied ISBNs', async () => {
+  const metadata = {
+    title: 'A book without an ISBN',
+    authors: ['Verified Author'],
+    tags: ['fiction'],
+    description: 'A verified description for a book that does not need an ISBN to be saved.',
+    coverUrl: 'https://example.com/cover.jpg',
+    sourceUrls: ['https://example.com/book'],
+  };
+  for (const isbnFields of [{}, { isbn: null }]) {
+    const response = await rpc('tools/call', {
+      name: 'add_book',
+      arguments: { ...metadata, ...isbnFields },
+    });
+    assert.ok(!response.result.isError, JSON.stringify(response));
+    const book = JSON.parse(response.result.content[0].text);
+    assert.equal(book.isbn, null);
+    assert.equal(book.metadataCompleteness.complete, true);
+    assert.deepEqual(book.metadataCompleteness.missingFields, []);
+    await request('/api/v1/books/' + book.id, 'DELETE');
+  }
+  const invalid = await rpc('tools/call', {
+    name: 'add_book',
+    arguments: { ...metadata, isbn: 'not-an-isbn' },
+  });
+  assert.ok(invalid.error || invalid.result.isError);
+});
+
+test('book filters and vocabulary discovery run in D1 with compact MCP pages', async () => {
+  const ids = [];
+  try {
+    for (const book of [
+      {
+        title: 'Clean Code',
+        authors: ['Robert Martin'],
+        tags: ['Programming', 'programming', 'Java'],
+        description: 'Software craftsmanship',
+        coverUrl: 'https://example.com/code.jpg',
+        notes: 'Team study',
+        status: 'reading',
+      },
+      {
+        title: 'Pragmatic Programmer',
+        authors: ['Andy Hunt'],
+        tags: ['Programming', 'Software Engineering'],
+        description: 'Practical techniques',
+      },
+      {
+        title: 'Programming a Life',
+        authors: ['A Novelist'],
+        tags: ['Fiction'],
+        description: 'A memoir',
+      },
+    ]) {
+      const response = await request('/api/v1/books', 'POST', book);
+      assert.equal(response.status, 201);
+      ids.push((await response.json()).id);
+    }
+    const call = async (name, args) => {
+      const result = await rpc('tools/call', { name, arguments: args });
+      assert.ok(!result.result.isError, JSON.stringify(result));
+      return JSON.parse(result.result.content[0].text);
+    };
+    const vocabulary = await call('list_book_values', { field: 'tags', q: 'PROGRAM' });
+    assert.equal(vocabulary.total, 1);
+    assert.equal(vocabulary.items[0].count, 2, 'duplicate case variants count a book once');
+    const first = await call('list_books', {
+      tags: ['PROGRAMMING'],
+      limit: 1,
+      sortBy: 'title',
+      order: 'asc',
+    });
+    assert.equal(first.total, 2);
+    assert.equal(first.nextOffset, 1);
+    assert.equal(first.items[0].title, 'Clean Code');
+    assert.equal(first.items[0].description, undefined);
+    assert.equal(first.items[0].hasCover, true);
+    const second = await call('list_books', {
+      tags: ['programming'],
+      limit: 1,
+      offset: first.nextOffset,
+      sortBy: 'title',
+      order: 'asc',
+    });
+    assert.equal(second.items[0].title, 'Pragmatic Programmer');
+    assert.equal(second.nextOffset, null);
+    const list = async (query) => {
+      const response = await request('/api/v1/books?' + query);
+      assert.equal(response.status, 200, await response.clone().text());
+      return response.json();
+    };
+    assert.equal((await list('tags=Programming&tags=Java&tagsMatch=all')).total, 1);
+    assert.equal((await list('tags=Java&tags=Fiction&tagsMatch=any')).total, 2);
+    assert.equal((await list('authors=andy%20hunt&tags=programming')).total, 1);
+    assert.equal((await list('author=MARTIN&status=reading&hasCover=true')).total, 1);
+    assert.equal((await list('tags=programming&hasCover=false')).total, 1);
+    assert.equal(
+      (await list('q=craftsmanship&searchFields=description&searchFields=notes')).total,
+      1,
+    );
+    assert.equal((await list('q=craftsmanship&searchFields=title')).total, 0);
+    assert.equal((await list('q=Java')).total, 1);
+    assert.equal((await list('notes=team&title=clean&hasDescription=true')).total, 1);
+    assert.equal((await list('q=%25')).total, 0, 'wildcards are literal');
+    assert.equal((await list('title=Clean')).items[0].description, 'Software craftsmanship');
+    const authorsResponse = await request('/api/v1/books/values?field=authors&status=reading');
+    assert.equal(authorsResponse.status, 200);
+    assert.deepEqual((await authorsResponse.json()).items, [{ value: 'Robert Martin', count: 1 }]);
+    const page = await call('list_book_values', { field: 'tags', limit: 1 });
+    assert.equal(page.total, 4);
+    assert.equal(page.nextOffset, 1);
+  } finally {
+    for (const id of ids) await request('/api/v1/books/' + id, 'DELETE');
   }
 });

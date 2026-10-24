@@ -61,4 +61,15 @@ app.all('*', async (c) => {
 
 app.onError(handleError);
 
-export default app;
+export default {
+  fetch(request, env, ctx) {
+    // Accept the Worker origin as an MCP URL as well as /mcp. Forward internally
+    // so clients keep their Authorization header and pass through the same checks.
+    const url = new URL(request.url);
+    if (url.pathname === '/') {
+      url.pathname = '/mcp';
+      request = new Request(url, request);
+    }
+    return app.fetch(request, env, ctx);
+  },
+} satisfies ExportedHandler<Env>;

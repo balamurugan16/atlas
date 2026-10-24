@@ -1,12 +1,27 @@
 import { Hono } from 'hono';
 import type { Env } from '../../env';
-import { bookSchema, listSchema, updateSchema } from './schema';
+import { bookSchema, bookValuesSchema, listSchema, updateSchema } from './schema';
 import { ReadingList } from './service';
 
 export const readingListRoutes = new Hono<{ Bindings: Env }>();
 
 readingListRoutes.get('/', async (c) =>
-  c.json(await new ReadingList(c.env.DB).list(listSchema.parse(c.req.query()))),
+  c.json(
+    await new ReadingList(c.env.DB).list(
+      listSchema.parse({
+        ...c.req.query(),
+        ...Object.fromEntries(
+          ['tags', 'authors', 'searchFields']
+            .filter((key) => c.req.queries(key))
+            .map((key) => [key, c.req.queries(key)]),
+        ),
+      }),
+    ),
+  ),
+);
+
+readingListRoutes.get('/values', async (c) =>
+  c.json(await new ReadingList(c.env.DB).values(bookValuesSchema.parse(c.req.query()))),
 );
 
 readingListRoutes.get('/:id', async (c) =>

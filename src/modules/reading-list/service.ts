@@ -1,4 +1,4 @@
-import type { BookInput, BookUpdate, ListInput } from './schema';
+import type { BookInput, BookUpdate, BookValuesInput, ListInput } from './schema';
 
 export class BookError extends Error {
   constructor(
@@ -58,24 +58,132 @@ export class ReadingList {
       args.push(input.status);
     }
     if (input.tag) {
-      where.push('EXISTS (SELECT 1 FROM json_each(books.tags) WHERE value = ?)');
+      where.push(
+        'EXISTS (SELECT 1 FROM json_each(books.tags) WHERE lower(trim(value)) = lower(trim(?)))',
+      );
       args.push(input.tag);
     }
-    if (input.q) {
+    if (input.tags) {
+      const placeholders = input.tags.map(() => '?').join(', ');
+      const matches = `SELECT DISTINCT lower(trim(value)) FROM json_each(books.tags) WHERE lower(trim(value)) IN (${placeholders})`;
       where.push(
-        '(instr(lower(title), lower(?)) > 0 OR EXISTS (SELECT 1 FROM json_each(books.authors) WHERE instr(lower(value), lower(?)) > 0))',
+        input.tagsMatch === 'all'
+          ? `(SELECT COUNT(*) FROM (${matches})) = ?`
+          : `EXISTS (${matches})`,
       );
-      args.push(input.q, input.q);
+      args.push(...input.tags);
+      if (input.tagsMatch === 'all') args.push(input.tags.length);
     }
-    const result = await this.db
-      .prepare(
-        `SELECT * FROM books ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
-      )
-      .bind(...args, input.limit + 1, input.offset)
-      .all<Row>();
+    if (input.authors) {
+      where.push(
+        `EXISTS (SELECT 1 FROM json_each(books.authors) WHERE lower(trim(value)) IN (${input.authors.map(() => '?').join(', ')}))`,
+      );
+      args.push(...input.authors);
+    }
+    if (input.author) {
+      where.push(
+        'EXISTS (SELECT 1 FROM json_each(books.authors) WHERE instr(lower(value), lower(?)) > 0)',
+      );
+      args.push(input.author);
+    }
+    for (const field of ['title', 'description', 'notes'] as const) {
+      if (input[field]) {
+        where.push(`instr(lower(coalesce(${field}, '')), lower(?)) > 0`);
+        args.push(input[field]!);
+      }
+    }
+    if (input.isbn) {
+      where.push('isbn = ?');
+      args.push(input.isbn);
+    }
+    for (const [field, value] of [
+      ['cover_url', input.hasCover],
+      ['description', input.hasDescription],
+    ] as const) {
+      if (value !== undefined)
+        where.push(`length(trim(coalesce(${field}, ''))) ${value ? '>' : '='} 0`);
+    }
+    if (input.q) {
+      // Only these fixed expressions can enter SQL; all user values are bound.
+      const expressions = {
+        title: "instr(lower(coalesce(title, '')), lower(?)) > 0",
+        authors:
+          'EXISTS (SELECT 1 FROM json_each(books.authors) WHERE instr(lower(value), lower(?)) > 0)',
+        tags: 'EXISTS (SELECT 1 FROM json_each(books.tags) WHERE instr(lower(value), lower(?)) > 0)',
+        description: "instr(lower(coalesce(description, '')), lower(?)) > 0",
+        notes: "instr(lower(coalesce(notes, '')), lower(?)) > 0",
+        isbn: "instr(coalesce(isbn, ''), replace(replace(?, '-', ''), ' ', '')) > 0",
+      };
+      where.push('(' + input.searchFields.map((field) => expressions[field]).join(' OR ') + ')');
+      args.push(...input.searchFields.map(() => input.q!));
+    }
+    const clause = where.length ? 'WHERE ' + where.join(' AND ') : '';
+    const sort = {
+      createdAt: 'created_at',
+      updatedAt: 'updated_at',
+      title: 'title COLLATE NOCASE',
+    }[input.sortBy];
+    const direction = input.order === 'asc' ? 'ASC' : 'DESC';
+    const [count, page] = await this.db.batch([
+      this.db.prepare(`SELECT COUNT(*) AS total FROM books ${clause}`).bind(...args),
+      this.db
+        .prepare(
+          `SELECT * FROM books ${clause} ORDER BY ${sort} ${direction}, id ${direction} LIMIT ? OFFSET ?`,
+        )
+        .bind(...args, input.limit, input.offset),
+    ]);
+    const total = (count.results[0] as { total: number }).total;
+    const items = (page.results as Row[]).map(decode).map((book) =>
+      input.view === 'summary'
+        ? {
+            id: book.id,
+            title: book.title,
+            authors: book.authors,
+            tags: book.tags,
+            status: book.status,
+            isbn: book.isbn,
+            hasCover: !!book.coverUrl?.trim(),
+            hasDescription: !!book.description?.trim(),
+          }
+        : book,
+    );
     return {
-      items: result.results.slice(0, input.limit).map(decode),
-      nextOffset: result.results.length > input.limit ? input.offset + input.limit : null,
+      items,
+      total,
+      nextOffset: input.offset + items.length < total ? input.offset + items.length : null,
+    };
+  }
+
+  async values(input: BookValuesInput) {
+    const expression = input.field === 'status' ? 'books.status' : 'entry.value';
+    const from =
+      input.field === 'status'
+        ? 'books'
+        : `books, json_each(books.${input.field === 'tags' ? 'tags' : 'authors'}) AS entry`;
+    const where = [`length(trim(${expression})) > 0`];
+    const args: string[] = [];
+    if (input.status) {
+      where.push('books.status = ?');
+      args.push(input.status);
+    }
+    if (input.q) {
+      where.push(`instr(lower(${expression}), lower(?)) > 0`);
+      args.push(input.q);
+    }
+    const grouped = `SELECT MIN(trim(${expression})) AS value, COUNT(DISTINCT books.id) AS count FROM ${from} WHERE ${where.join(' AND ')} GROUP BY lower(trim(${expression}))`;
+    const [count, page] = await this.db.batch([
+      this.db.prepare(`SELECT COUNT(*) AS total FROM (${grouped})`).bind(...args),
+      this.db
+        .prepare(`${grouped} ORDER BY count DESC, value COLLATE NOCASE ASC LIMIT ? OFFSET ?`)
+        .bind(...args, input.limit, input.offset),
+    ]);
+    const total = (count.results[0] as { total: number }).total;
+    const items = page.results as { value: string; count: number }[];
+    return {
+      field: input.field,
+      items,
+      total,
+      nextOffset: input.offset + items.length < total ? input.offset + items.length : null,
     };
   }
 
