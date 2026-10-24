@@ -1,0 +1,8 @@
+API_TOKEN=replace-with-a-long-random-token
+# OAuth provider configuration (all four required to enable OAuth):
+# OAUTH_ISSUER=https://your-authorization-server.example.com/
+# OAUTH_JWKS_URL=https://your-authorization-server.example.com/.well-known/jwks.json
+# OAUTH_AUDIENCE=http://localhost:8787/mcp
+# OAUTH_OWNER_SUB=your-provider-user-subject
+# PUBLIC_URL=http://localhost:8787
+# DASHBOARD_ORIGIN=http://localhost:5173
