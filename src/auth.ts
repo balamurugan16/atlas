@@ -1,41 +1,33 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose';
 import type { Env } from './env';
-const keys = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
-export function oauthEnabled(env: Env) {
-  return !!(env.OAUTH_ISSUER && env.OAUTH_JWKS_URL && env.OAUTH_AUDIENCE && env.OAUTH_OWNER_SUB);
+
+export function publicOrigin(env: Env): string | null {
+  if (!env.PUBLIC_URL) return null;
+  try {
+    const url = new URL(env.PUBLIC_URL);
+    const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) return null;
+    if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
 }
-export async function authorized(request: Request, env: Env): Promise<boolean> {
+
+export function oauthEnabled(env: Env): boolean {
+  return !!(
+    publicOrigin(env) && env.OAUTH_KV && env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET &&
+    env.GITHUB_OWNER_ID && /^[1-9]\d*$/.test(env.GITHUB_OWNER_ID)
+  );
+}
+
+export async function authorizedWithApiToken(request: Request, env: Env): Promise<boolean> {
+  if (!env.API_TOKEN) return false;
   const header = request.headers.get('Authorization');
   if (!header?.startsWith('Bearer ')) return false;
-  const token = header.slice(7);
-  if (env.API_TOKEN) {
-    const digest = async (v: string) =>
-      new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v)));
-    const [a, b] = await Promise.all([digest(token), digest(env.API_TOKEN)]);
-    let difference = 0;
-    for (let i = 0; i < a.length; i++) difference |= a[i] ^ b[i];
-    if (!difference) return true;
-  }
-  if (!oauthEnabled(env)) return false;
-  try {
-    const jwksUrl = env.OAUTH_JWKS_URL!;
-    let jwks = keys.get(jwksUrl);
-    if (!jwks) {
-      jwks = createRemoteJWKSet(new URL(jwksUrl));
-      keys.set(jwksUrl, jwks);
-    }
-    const { payload } = await jwtVerify(token, jwks, {
-      issuer: env.OAUTH_ISSUER,
-      audience: env.OAUTH_AUDIENCE,
-      algorithms: ['RS256', 'ES256'],
-      requiredClaims: ['exp', 'sub'],
-    });
-    return (
-      payload.sub === env.OAUTH_OWNER_SUB &&
-      typeof payload.scope === 'string' &&
-      payload.scope.split(' ').includes('atlas')
-    );
-  } catch {
-    return false;
-  }
+  const digest = async (value: string) =>
+    new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)));
+  const [a, b] = await Promise.all([digest(header.slice(7)), digest(env.API_TOKEN)]);
+  let difference = 0;
+  for (let i = 0; i < a.length; i++) difference |= a[i] ^ b[i];
+  return difference === 0;
 }

@@ -1,13 +1,11 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
-import { ZodError } from 'zod';
-import { createMcpHandler } from 'agents/mcp/server';
+import { api } from './api';
+import { authorizedWithApiToken, oauthEnabled, publicOrigin } from './auth';
 import type { Env } from './env';
-import { authorized, oauthEnabled } from './auth';
-import { createServer } from './mcp';
-import { readingListRoutes } from './modules/reading-list/http';
-import { BookError } from './modules/reading-list/service';
+import { handleError } from './errors';
+import { getOAuthProvider } from './oauth';
 
 export const app = new Hono<{ Bindings: Env }>();
 app.use('*', async (c, next) => {
@@ -17,68 +15,38 @@ app.use('*', async (c, next) => {
 });
 app.use('*', bodyLimit({ maxSize: 64 * 1024 }));
 app.use('*', async (c, next) => {
+  const ownOrigin = publicOrigin(c.env) || new URL(c.req.url).origin;
+  if (c.env.PUBLIC_URL && (!publicOrigin(c.env) || new URL(c.req.url).origin !== ownOrigin))
+    return c.json({ error: 'Request origin does not match PUBLIC_URL' }, 400);
   const origin = c.req.header('Origin');
-  const ownOrigin = c.env.PUBLIC_URL ? new URL(c.env.PUBLIC_URL).origin : new URL(c.req.url).origin;
   if (origin && origin !== ownOrigin && origin !== c.env.DASHBOARD_ORIGIN)
     return c.json({ error: 'Origin not allowed' }, 403);
   return cors({
     origin: c.env.DASHBOARD_ORIGIN || ownOrigin,
     allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Authorization', 'Content-Type', 'MCP-Protocol-Version', 'Mcp-Session-Id'],
-    exposeHeaders: ['Location'],
+    exposeHeaders: ['Location', 'WWW-Authenticate'],
   })(c, next);
 });
 app.get('/health', (c) => c.json({ status: 'ok' }));
-const metadata = (env: Env) => ({
-  resource: env.OAUTH_AUDIENCE,
-  authorization_servers: [env.OAUTH_ISSUER],
-  scopes_supported: ['atlas'],
-  bearer_methods_supported: ['header'],
-});
-for (const path of [
-  '/.well-known/oauth-protected-resource',
-  '/.well-known/oauth-protected-resource/mcp',
-]) {
-  app.get(path, (c) =>
-    oauthEnabled(c.env)
-      ? c.json(metadata(c.env))
-      : c.json({ error: 'OAuth is not configured' }, 404),
-  );
-}
-app.use('/api/*', protect);
-app.use('/mcp', protect);
-async function protect(c: import('hono').Context<{ Bindings: Env }>, next: import('hono').Next) {
-  if (!c.env.API_TOKEN && !oauthEnabled(c.env))
-    return c.json({ error: 'Authentication is not configured' }, 503);
-  if (!(await authorized(c.req.raw, c.env))) {
-    const base = c.env.PUBLIC_URL || new URL(c.req.url).origin;
-    c.header(
-      'WWW-Authenticate',
-      oauthEnabled(c.env)
-        ? `Bearer resource_metadata="${base.replace(/\/$/, '')}/.well-known/oauth-protected-resource", scope="atlas"`
-        : 'Bearer realm="atlas"',
+app.all('*', async (c) => {
+  const protectedPath = c.req.path === '/mcp' || c.req.path.startsWith('/mcp/') || c.req.path.startsWith('/api/');
+  if (protectedPath && await authorizedWithApiToken(c.req.raw, c.env))
+    return api.fetch(c.req.raw, c.env, c.executionCtx);
+  if (oauthEnabled(c.env))
+    return getOAuthProvider(c.env).fetch(
+      c.req.raw, c.env,
+      // Hono exposes a narrower view of the actual Workers execution context.
+      c.executionCtx as Parameters<ReturnType<typeof getOAuthProvider>['fetch']>[2],
     );
+  if (protectedPath) {
+    if (!c.env.API_TOKEN) return c.json({ error: 'Authentication is not configured' }, 503);
+    c.header('WWW-Authenticate', 'Bearer realm="atlas"');
     return c.json({ error: 'Unauthorized' }, 401);
   }
-  await next();
-}
-app.route('/api/v1/books', readingListRoutes);
-app.all('/mcp', (c) =>
-  createMcpHandler(() => createServer(c.env.DB), {
-    route: '/mcp',
-    corsOptions: false,
-    // Origin validation has already run above, including malformed/opaque Origins.
-    allowedOriginHostnames: '*',
-    allowedHostnames: [new URL(c.env.PUBLIC_URL || c.req.url).hostname],
-  }).fetch(c.req.raw),
-);
-app.notFound((c) => c.json({ error: 'Not found' }, 404));
-app.onError((error, c) => {
-  if (error instanceof ZodError)
-    return c.json({ error: 'Validation failed', issues: error.issues }, 400);
-  if (error instanceof SyntaxError) return c.json({ error: 'Invalid JSON body' }, 400);
-  if (error instanceof BookError) return c.json({ error: error.message }, error.status);
-  console.error('Request failed', error);
-  return c.json({ error: 'Internal server error' }, 500);
+  if (['/authorize', '/auth/github/callback'].includes(c.req.path) || c.req.path.startsWith('/oauth/'))
+    return c.json({ error: 'GitHub OAuth is not configured' }, 503);
+  return c.json({ error: 'Not found' }, 404);
 });
+app.onError(handleError);
 export default app;

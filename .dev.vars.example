@@ -1,8 +1,12 @@
+# Optional personal token for curl/scripts; never embed in a frontend bundle.
 API_TOKEN=replace-with-a-long-random-token
-# OAuth provider configuration (all four required to enable OAuth):
-# OAUTH_ISSUER=https://your-authorization-server.example.com/
-# OAUTH_JWKS_URL=https://your-authorization-server.example.com/.well-known/jwks.json
-# OAUTH_AUDIENCE=http://localhost:8787/mcp
-# OAUTH_OWNER_SUB=your-provider-user-subject
-# PUBLIC_URL=http://localhost:8787
+
+# GitHub OAuth is enabled only when all four variables and OAUTH_KV are configured.
+# Local HTTP API tests do not need GitHub credentials.
+# PUBLIC_URL=https://your-worker.workers.dev
+# GITHUB_CLIENT_ID=your-github-oauth-app-client-id
+# GITHUB_CLIENT_SECRET=your-github-oauth-app-client-secret
+# GITHUB_OWNER_ID=your-numeric-github-user-id
+
+# Optional exact origin for a future dashboard.
 # DASHBOARD_ORIGIN=http://localhost:5173
