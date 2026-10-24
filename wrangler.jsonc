@@ -17,5 +17,10 @@
       "binding": "OAUTH_KV",
       "id": "eb4da41d39b04be7805e730b4701c876"
     }
-  ]
+  ],
+  "vars": {
+    "GITHUB_OWNER_ID": "64843585",
+    "PUBLIC_URL": "https://atlas.balamurugand16.workers.dev",
+    "GITHUB_CLIENT_ID": "Ov23ctD2jNxpKRRhEVcd"
+  }
 }

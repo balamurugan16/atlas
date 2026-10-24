@@ -3,36 +3,12 @@ import {
   AuthorizationError,
   CimdFetchError,
   authorizationErrorRedirect,
-  type ConsentDescription,
 } from '@cloudflare/workers-oauth-provider';
 import { z } from 'zod';
 import { publicOrigin } from './auth';
 import type { AuthProps, Env } from './env';
 import { handleError } from './errors';
-
-const escape = (value: string) => value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
-
-function consentPage(details: ConsentDescription, handle: string): string {
-  const publisher = details.clientDomain
-    ? `Client domain: <strong>${escape(details.clientDomain)}</strong>.`
-    : 'This client registered itself; its name is not verified.';
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connect to Atlas</title></head><body>
-<main><h1>Connect ${escape(details.clientName)} to Atlas?</h1>
-<p>${publisher}</p>
-<p>Access will be sent to <strong>${escape(details.redirectHost)}</strong>.</p>
-${details.redirectIsLoopback ? '<p>This sends access to an app on your computer. Continue only if you started this connection.</p>' : ''}
-<p>The <strong>atlas</strong> permission allows reading, adding, changing, and deleting books in your personal reading list.</p>
-${details.scope.includes('offline_access') ? '<p>Offline access lets the client renew access without signing in again, for up to 30 days.</p>' : ''}
-<p>Requested scopes: ${details.scope.map(escape).join(', ')}.</p>
-<p>Continue with GitHub to verify the owner of this reading list.</p>
-<form method="post" action="/authorize">
-<input type="hidden" name="handle" value="${escape(handle)}">
-<button name="decision" value="approve">Allow and sign in with GitHub</button>
-<button name="decision" value="deny">Deny</button>
-</form></main></body></html>`;
-}
+import { consentPage } from './consent';
 
 async function challenge(verifier: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
@@ -129,11 +105,16 @@ githubAuth.get('/authorize', async (c) => {
   const details = await oauth.describeConsent(request);
   const consent = await oauth.beginConsent(request);
   consent.headers.set('Content-Type', 'text/html; charset=utf-8');
+  // Chromium checks form-action against the redirect chain too. Both approval
+  // (GitHub) and denial (the registered client callback) leave our own origin.
+  // describeConsent only returns a callback validated against the client's registration.
+  const callbackOrigin = new URL(details.redirectUri).origin;
+  const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
   consent.headers.set(
     'Content-Security-Policy',
-    "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    `default-src 'none'; style-src 'nonce-${nonce}'; form-action 'self' https://github.com ${callbackOrigin}; frame-ancestors 'none'; base-uri 'none'`,
   );
-  return new Response(consentPage(details, consent.handle), { headers: consent.headers });
+  return new Response(consentPage(details, consent.handle, nonce), { headers: consent.headers });
 });
 
 githubAuth.post('/authorize', async (c) => {

@@ -259,9 +259,35 @@ async function startFlow({
   const page = await visit('/authorize?' + params);
   assert.equal(page.status, 200, await page.clone().text());
   const html = await page.text();
+  const styleNonce = /<style nonce="([^"]+)"/.exec(html)?.[1];
+  assert.ok(styleNonce, 'Consent styles need a per-response nonce');
+  assert.ok(
+    page.headers.get('Content-Security-Policy').includes(`style-src 'nonce-${styleNonce}'`),
+  );
+  assert.ok(!page.headers.get('Content-Security-Policy').includes("'unsafe-inline'"));
+
   const handle = /name="handle" value="([^"]+)"/.exec(html)?.[1];
   assert.ok(handle, html);
   assert.match(page.headers.get('Content-Security-Policy'), /frame-ancestors 'none'/);
+  // Real Chromium browsers also check the form's redirect targets against form-action.
+  const policy = page.headers.get('Content-Security-Policy');
+  const sources = policy
+    .split(';')
+    .map((directive) => directive.trim().split(/\s+/))
+    .find(([name]) => name === 'form-action')
+    .slice(1);
+  assert.ok(sources.includes("'self'"));
+  assert.ok(sources.includes('https://github.com'), 'Approval must be able to reach GitHub');
+  assert.ok(
+    sources.includes(new URL(redirect).origin),
+    'Denial must be able to return to the registered client',
+  );
+  assert.ok(
+    !sources.includes('*') && !sources.includes('https:'),
+    'Allow only specific OAuth destinations',
+  );
+  assert.match(policy, /default-src 'none'/);
+  assert.match(policy, /base-uri 'none'/);
   const cookie = page.headers.get('Set-Cookie');
   assert.match(cookie, /HttpOnly/i);
   assert.match(cookie, /Secure/i);

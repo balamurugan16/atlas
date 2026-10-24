@@ -8,12 +8,15 @@ import { handleError } from './errors';
 import { getOAuthProvider } from './oauth';
 
 export const app = new Hono<{ Bindings: Env }>();
+
 app.use('*', async (c, next) => {
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('Cache-Control', 'no-store');
   await next();
 });
+
 app.use('*', bodyLimit({ maxSize: 64 * 1024 }));
+
 app.use('*', async (c, next) => {
   const ownOrigin = publicOrigin(c.env) || new URL(c.req.url).origin;
   if (c.env.PUBLIC_URL && (!publicOrigin(c.env) || new URL(c.req.url).origin !== ownOrigin))
@@ -28,7 +31,9 @@ app.use('*', async (c, next) => {
     exposeHeaders: ['Location', 'WWW-Authenticate'],
   })(c, next);
 });
+
 app.get('/health', (c) => c.json({ status: 'ok' }));
+
 app.all('*', async (c) => {
   const protectedPath =
     c.req.path === '/mcp' || c.req.path.startsWith('/mcp/') || c.req.path.startsWith('/api/');
@@ -53,5 +58,7 @@ app.all('*', async (c) => {
     return c.json({ error: 'GitHub OAuth is not configured' }, 503);
   return c.json({ error: 'Not found' }, 404);
 });
+
 app.onError(handleError);
+
 export default app;
